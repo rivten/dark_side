@@ -14,6 +14,10 @@ function main(){
 
     projection_matrix = init_webgl_context(gl);
 
+    postprocessing_shader = new PostprocessingShader(gl);
+    const postprocessing_texture = init_postprocessing(gl);
+    const framebuffer = init_framebuffer(gl, postprocessing_texture);
+
     sun_position = [0, 0, -20]
 
     var earth = new Planet(
@@ -62,11 +66,37 @@ function main(){
             );
         });
 
-        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        // rendering scene to postprocessing texture
+        {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+            gl.bindTexture(gl.TEXTURE_2D, postprocessing_texture);
+            gl.viewport(
+                0,
+                0,
+                gl.canvas.clientWidth,
+                gl.canvas.clientHeight,
+            );
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+            objects_to_draw.forEach(function(planet){
+                planet.display()
+            });
+        }
 
-        objects_to_draw.forEach(function(planet){
-            planet.display()
-        });
+        // rendering scene to canvas
+        {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.bindTexture(gl.TEXTURE_2D, postprocessing_texture);
+            gl.viewport(
+                0,
+                0,
+                gl.canvas.clientWidth,
+                gl.canvas.clientHeight,
+            );
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+            postprocessing_shader.display();
+
+        }
 
         requestAnimationFrame(render);
     }
@@ -801,6 +831,276 @@ function Sun(
 }
 
 
+function compute_kernel_weight(kernel){
+    var weight = kernel.reduce(function(prev, curr){
+        return prev + curr;
+    });
+    return weight <= 0 ? 1 : weight;
+}
+
+function PostprocessingShader(gl){
+    `
+    Class for postprocessing operations.
+    Constructor arguments:
+        -gl                 WebGLRenderingContext
+    Attributes:
+        -vs_source          string
+            defines vertex shader
+        -fs_source          string
+            defines fragment shader
+        -program_info       object
+            contains:
+                shader_program,
+                attrib_locations,
+                    vertex position
+                    texture coord
+                uniform_locations
+                    screen texture
+                    texture size
+                    kernel
+                    kernel weight
+        -buffers            object
+            contains: position, indices, texutre coords buffers
+        -vertices           [float, ...]
+        -indices            [int, ...]
+        -texture_coords     [float, ...]
+        -blur_kernel        [float, ...]
+    Methods:
+        -display
+    `
+
+    this.vs_source = `
+        attribute vec4 a_vertex_position;
+        attribute vec2 a_texture_coord;
+
+        varying highp vec2 v_texture_coord;
+
+        void main(void){
+            gl_Position = a_vertex_position;
+            v_texture_coord = a_texture_coord;
+        }
+    `
+    this.fs_source = `
+        varying highp vec2 v_texture_coord;
+
+        uniform sampler2D u_screen_texture;
+        uniform mediump vec2 u_texture_size;
+
+        uniform mediump float u_kernel[9];
+        uniform mediump float u_kernel_weight;
+
+        void main(void){
+
+            mediump vec2 one_pixel_size = vec2(1.0, 1.0) / u_texture_size;
+
+            mediump vec4 color_sum =
+                texture2D(
+                    u_screen_texture,
+                    v_texture_coord + one_pixel_size * vec2(-1, -1)
+                ) * u_kernel[0] +
+                texture2D(
+                    u_screen_texture,
+                    v_texture_coord + one_pixel_size * vec2(0, -1)
+                ) * u_kernel[1] +
+                texture2D(
+                    u_screen_texture,
+                    v_texture_coord + one_pixel_size * vec2(1, -1)
+                ) * u_kernel[2] +
+                texture2D(
+                    u_screen_texture,
+                    v_texture_coord + one_pixel_size * vec2(-1, 0)
+                ) * u_kernel[3] +
+                texture2D(
+                    u_screen_texture,
+                    v_texture_coord + one_pixel_size * vec2(0, 0)
+                ) * u_kernel[4] +
+                texture2D(
+                    u_screen_texture,
+                    v_texture_coord + one_pixel_size * vec2(1, 0)
+                ) * u_kernel[5] +
+                texture2D(
+                    u_screen_texture,
+                    v_texture_coord + one_pixel_size * vec2(-1, 1)
+                ) * u_kernel[6] +
+                texture2D(
+                    u_screen_texture,
+                    v_texture_coord + one_pixel_size * vec2(0, 1)
+                ) * u_kernel[7] +
+                texture2D(
+                    u_screen_texture,
+                    v_texture_coord + one_pixel_size * vec2(1, 1)
+                ) * u_kernel[8]
+                ;
+
+            gl_FragColor = vec4((color_sum / u_kernel_weight).rgb, 1.0);
+        }
+    `
+
+    const shader_program = init_shader_program(
+        gl,
+        this.vs_source,
+        this.fs_source,
+    );
+
+    this.program_info = {
+        program: shader_program,
+        attrib_locations: {
+            vertex_position: gl.getAttribLocation(
+                shader_program,
+                "a_vertex_position"
+            ),
+            texture_coord: gl.getAttribLocation(
+                shader_program,
+                "a_texture_coord"
+            )
+        },
+        uniform_locations: {
+            screen_texture: gl.getUniformLocation(
+                shader_program,
+                "u_screen_texture"
+            ),
+            texture_size: gl.getUniformLocation(
+                shader_program,
+                "u_texture_size"
+            ),
+            kernel: gl.getUniformLocation(
+                shader_program,
+                "u_kernel[0]"
+            ),
+            kernel_weight: gl.getUniformLocation(
+                shader_program,
+                "u_kernel_weight"
+            )
+        }
+    };
+
+    const position_buffer = gl.createBuffer();
+    const index_buffer = gl.createBuffer();
+    const texture_coord_buffer = gl.createBuffer();
+    this.buffers = {
+        position: position_buffer,
+        indices: index_buffer,
+        texture_coord: texture_coord_buffer
+    }
+
+    this.vertices = [
+        -1.0, -1.0, 0.0,
+        1.0, -1.0, 0.0,
+        1.0, 1.0, 0.0,
+        -1.0, 1.0, 0.0,
+    ]
+    this.indices = [
+        0, 1, 2, 0, 2, 3,
+    ]
+    this.texture_coords = [
+        0.0, 0.0,
+        1.0, 0.0,
+        1.0, 1.0,
+        0.0, 1.0,
+    ]
+
+    this.blur_kernel = [
+        1.0 / 16.0, 2.0 / 16.0, 1.0 / 16.0,
+        2.0 / 16.0, 4.0 / 16.0, 2.0 / 16.0,
+        1.0 / 16.0, 2.0 / 16.0, 1.0 / 16.0
+    ]
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.position);
+    gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array(this.vertices),
+        gl.STATIC_DRAW,
+    );
+
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.buffers.indices);
+    gl.bufferData(
+        gl.ELEMENT_ARRAY_BUFFER,
+        new Uint16Array(this.indices),
+        gl.STATIC_DRAW,
+    );
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.texture_coord);
+    gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array(this.texture_coords),
+        gl.STATIC_DRAW,
+    )
+
+    this.display = function(){
+        `Display this postprocessing shader's texture on canvas`
+
+        gl.useProgram(this.program_info.program)
+
+        // fetch vertices positions from buffer
+        {
+            const nb_components = 3; // nb values per vertex in buffer
+            const type = gl.FLOAT;
+            const normalize = false;
+            const stride = 0
+            const offset = 0
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.position)
+            gl.vertexAttribPointer(
+                this.program_info.attrib_locations.vertex_position,
+                nb_components,
+                type,
+                normalize,
+                stride,
+                offset
+            )
+            gl.enableVertexAttribArray(
+                this.program_info.attrib_locations.vertex_position
+            )
+        }
+
+        // fetch texture coordinates from buffer
+        {
+            const num = 2;
+            const type = gl.FLOAT;
+            const normalize = false;
+            const stride = 0;
+            const offset = 0;
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.texture_coord);
+            gl.vertexAttribPointer(
+                this.program_info.attrib_locations.texture_coord,
+                num,
+                type,
+                normalize,
+                stride,
+                offset,
+            );
+            gl.enableVertexAttribArray(
+                this.program_info.attrib_locations.texture_coord
+            );
+        }
+
+        gl.uniform2f(
+            this.program_info.uniform_locations.texture_size,
+            gl.canvas.clientWidth,
+            gl.canvas.clientHeight,
+        );
+        gl.uniform1fv(
+            this.program_info.uniform_locations.kernel,
+            this.blur_kernel,
+        );
+        gl.uniform1f(
+            this.program_info.uniform_locations.kernel_weight,
+            compute_kernel_weight(this.blur_kernel),
+        );
+
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.buffers.indices)
+
+        // draw
+        {
+            const offset = 0
+            const vertex_count = this.indices.length
+            const type = gl.UNSIGNED_SHORT
+            gl.drawElements(gl.TRIANGLES, vertex_count, type, offset)
+        }
+    }
+
+}
+
+
 function init_webgl_context(gl){
     `
     Initiate WebGL context and create perspective matrix.
@@ -903,4 +1203,75 @@ function load_shader(gl, type, source) {
     }
 
     return shader
+}
+
+function init_postprocessing(gl){
+    `
+    Create, and bind empty texture fitting the canvas.
+    Input:
+        -gl         WebGLRenderingContext object
+    Output:
+        -texture    WebGLTexture object
+    `
+
+    // creating texture to render to
+    const texture_width = gl.canvas.clientWidth;
+    const texture_height = gl.canvas.clientHeight;
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    {
+        // define size and format of level 0
+        const level = 0;
+        const internal_format = gl.RGBA;
+        const border = 0;
+        const format = gl.RGBA;
+        const type = gl.UNSIGNED_BYTE;
+        const data = null;
+        gl.texImage2D(
+            gl.TEXTURE_2D,
+            level,
+            internal_format,
+            texture_width,
+            texture_height,
+            border,
+            format,
+            type,
+            data
+        )
+        // set the filtering so we don't need mips
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
+
+    return texture
+}
+
+function init_framebuffer(gl, target_texture){
+    `
+    Create, bind, and attach framebuffer to texture.
+    Input:
+        -gl                 WebGLRenderingContext object
+        -target_texture     WebGLTexture object
+    Output:
+        -framebuffer        WebGLFramebuffer object
+    `
+
+    // creating and binding framebuffer
+    const framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+
+    // attach texture
+    const attachment_point = gl.COLOR_ATTACHMENT0;
+    gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        attachment_point,
+        gl.TEXTURE_2D,
+        target_texture,
+        0
+    )
+
+    if(gl.isFramebuffer(framebuffer)){
+        return framebuffer
+    }
 }
