@@ -289,7 +289,7 @@ function Planet(
             highp vec3 ambient_light = vec3(0.3, 0.3, 0.3);
             highp vec3 sunlight_color = vec3(1.0, 1.0, 1.0);
             highp vec3 sun_vector = u_sun_position - (
-                u_model_view_matrix * a_vertex_position
+                u_model_view_matrix * vec4(1.0, 1.0, 1.0, 1.0)
             ).xyz;
 
             highp vec4 transformed_normal = u_normal_matrix * vec4(
